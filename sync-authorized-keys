@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+url='https://raw.githubusercontent.com/levest28/server-public-keys/refs/heads/main/authorized_keys'
+target_user="$(id -un)"
+
+if ! passwd_entry="$(getent passwd "$target_user")"; then
+  echo "Could not find account for target user: $target_user" >&2
+  exit 1
+fi
+
+IFS=: read -r _ _ target_uid target_gid _ target_home _ <<<"$passwd_entry"
+
+if [[ -z "$target_home" || "$target_home" == "/" || ! -d "$target_home" ]]; then
+  echo "Refusing to use invalid home directory for $target_user: ${target_home:-<empty>}" >&2
+  exit 1
+fi
+
+ssh_dir="$target_home/.ssh"
+target="$ssh_dir/authorized_keys"
+backup_dir="$ssh_dir/authorized_keys.backups"
+
+tmp="$(mktemp)"
+cleanup() {
+  rm -f "$tmp"
+}
+trap cleanup EXIT
+
+curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$tmp"
+
+if [[ ! -s "$tmp" ]]; then
+  echo "Refusing to install empty authorized_keys from $url" >&2
+  exit 1
+fi
+
+if ! awk '
+  NF == 0 || $1 ~ /^#/ { next }
+  $1 ~ /^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)$/ { next }
+  { bad = 1; print "Invalid authorized_keys line " NR ": " $0 > "/dev/stderr" }
+  END { exit bad }
+' "$tmp"; then
+  echo "Refusing to install invalid authorized_keys from $url" >&2
+  exit 1
+fi
+
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  install -d -m 700 -o "$target_uid" -g "$target_gid" "$ssh_dir" "$backup_dir"
+else
+  install -d -m 700 "$ssh_dir" "$backup_dir"
+fi
+
+if [[ -f "$target" ]] && ! cmp -s "$tmp" "$target"; then
+  cp -p "$target" "$backup_dir/authorized_keys.$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  install -m 600 -o "$target_uid" -g "$target_gid" "$tmp" "$target"
+else
+  install -m 600 "$tmp" "$target"
+fi
